@@ -22,75 +22,130 @@ permissions:
 jobs:
   review:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install openai PyGithub
+        run: pip install openai PyGithub
 
       - name: Create review script
         run: |
-          cat > codex_review.py << 'EOF'
+          cat > codex_review.py << 'PYEOF'
           import os
           from openai import OpenAI
+
+          MAX_CHUNK = 3000
+
+          SYSTEM_PROMPT = (
+              "You are a senior software engineer reviewing a pull request.\n"
+              "Review the code diff for:\n"
+              "1. Bugs and correctness issues\n"
+              "2. Security vulnerabilities\n"
+              "3. Performance problems\n"
+              "4. Missing tests\n"
+              "5. Architecture and readability improvements\n\n"
+              "Return output in EXACTLY this markdown format (omit sections with no issues):\n\n"
+              "## Bugs\n- item\n\n"
+              "## Security Issues\n- item\n\n"
+              "## Performance Concerns\n- item\n\n"
+              "## Missing Tests\n- item\n\n"
+              "## Suggestions\n- item\n\n"
+              "Be concise (max 300 words). If everything looks good, write only:\n"
+              "## Suggestions\n"
+              "- ✅ Code looks good. [one small improvement]"
+          )
+
+
+          def chunk_diff(diff: str) -> list:
+              """Split diff into chunks, preferring file boundaries."""
+              if len(diff) <= MAX_CHUNK:
+                  return [diff]
+              chunks = []
+              while diff:
+                  if len(diff) <= MAX_CHUNK:
+                      chunks.append(diff)
+                      break
+                  cut = diff.rfind("\ndiff --git ", 0, MAX_CHUNK)
+                  if cut <= 0:
+                      cut = diff.rfind("\n", 0, MAX_CHUNK)
+                  if cut <= 0:
+                      cut = MAX_CHUNK
+                  chunks.append(diff[:cut])
+                  diff = diff[cut:]
+              return chunks
+
+
+          def review_chunk(client, model: str, chunk: str, idx: int, total: int) -> str:
+              label = f"(chunk {idx}/{total}) " if total > 1 else ""
+              prompt = f"Review this code diff {label}:\n\n```diff\n{chunk}\n```"
+              try:
+                  resp = client.responses.create(
+                      model=model,
+                      instructions=SYSTEM_PROMPT,
+                      input=prompt,
+                  )
+                  return (resp.output_text or "").strip()
+              except Exception as e:
+                  return f"Review failed for chunk {idx}: {e}"
+
 
           def main() -> None:
               api_key = os.environ["OPENAI_API_KEY"]
               diff = os.environ.get("DIFF", "").strip()
-              model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+              model = os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
 
               if not diff:
-                  with open("review.md", "w", encoding="utf-8") as f:
-                      f.write("## 🤖 Codex Review\n\n✅ No significant changes to review.")
+                  with open("review.md", "w") as f:
+                      f.write("<!-- CODEX_REVIEW_BOT -->\n\n## Codex Review\n\nNo significant changes to review.")
                   return
 
-              prompt = f"""You are an expert code reviewer.
-
-Review the following code diff and provide 3–5 specific, actionable suggestions.
-Focus on: correctness/bugs, security, performance, readability/maintainability.
-Be concise (under 500 words). If it looks good, say "✅ Looks good" and include 1 small improvement.
-
-Code diff:
-```diff
-{diff}
-```
-"""
-
               client = OpenAI(api_key=api_key)
-              resp = client.responses.create(
-                  model=model,
-                  input=prompt,
+              chunks = chunk_diff(diff)
+
+              # Cap at 10 chunks to control cost
+              if len(chunks) > 10:
+                  chunks = chunks[:10]
+
+              reviews = []
+              for i, chunk in enumerate(chunks, 1):
+                  result = review_chunk(client, model, chunk, i, len(chunks))
+                  if result:
+                      reviews.append(result)
+
+              if not reviews:
+                  merged = "No issues found."
+              elif len(reviews) == 1:
+                  merged = reviews[0]
+              else:
+                  merged = "\n\n---\n\n".join(reviews)
+
+              chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
+              markdown = (
+                  f"<!-- CODEX_REVIEW_BOT -->\n\n"
+                  f"## Codex Review\n\n"
+                  f"{merged}\n\n"
+                  f"---\n"
+                  f"*Model: `{model}`{chunk_note}*\n"
               )
-              review_text = (resp.output_text or "").strip() or "✅ Looks good."
-
-              markdown = f"""## 🤖 Codex Code Review
-
-{review_text}
-
----
-*Generated by OpenAI model `{model}`*
-"""
-              with open("review.md", "w", encoding="utf-8") as f:
+              with open("review.md", "w") as f:
                   f.write(markdown)
+
 
           if __name__ == "__main__":
               main()
-          EOF
+          PYEOF
 
-      - name: Run Codex Review
+      - name: Run review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
-          PR_NUMBER: ${{ github.event.inputs.pr_number }}
-          REPO: ${{ github.event.inputs.repo }}
           DIFF: ${{ github.event.inputs.diff }}
         run: python codex_review.py
 
-      - name: Post review to target PR
+      - name: Post or update PR comment
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ github.event.inputs.pr_number }}
@@ -101,10 +156,23 @@ Code diff:
             const fs = require('fs');
             const review = fs.readFileSync('review.md', 'utf8');
             const [owner, repo] = process.env.REPO.split('/');
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const marker = '<!-- CODEX_REVIEW_BOT -->';
 
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: parseInt(process.env.PR_NUMBER, 10),
-              body: review
+            // Find existing bot comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber
             });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: review
+              });
+              console.log(`Updated existing comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: review
+              });
+              console.log('Created new review comment');
+            }
