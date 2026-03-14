@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 jobs:
-  review:
+  openai-review:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -29,7 +29,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install openai PyGithub
+        run: pip install openai
 
       - name: Create review script
         run: |
@@ -55,12 +55,11 @@ jobs:
               "## Suggestions\n- item\n\n"
               "Be concise (max 300 words). If everything looks good, write only:\n"
               "## Suggestions\n"
-              "- ✅ Code looks good. [one small improvement]"
+              "- Code looks good. [one small improvement]"
           )
 
 
           def chunk_diff(diff: str) -> list:
-              """Split diff into chunks, preferring file boundaries."""
               if len(diff) <= MAX_CHUNK:
                   return [diff]
               chunks = []
@@ -78,7 +77,7 @@ jobs:
               return chunks
 
 
-          def review_chunk(client, model: str, chunk: str, idx: int, total: int) -> str:
+          def review_chunk(client, model, chunk, idx, total):
               label = f"(chunk {idx}/{total}) " if total > 1 else ""
               prompt = f"Review this code diff {label}:\n\n```diff\n{chunk}\n```"
               try:
@@ -92,20 +91,18 @@ jobs:
                   return f"Review failed for chunk {idx}: {e}"
 
 
-          def main() -> None:
+          def main():
               api_key = os.environ["OPENAI_API_KEY"]
               diff = os.environ.get("DIFF", "").strip()
               model = os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
 
               if not diff:
-                  with open("review.md", "w") as f:
-                      f.write("<!-- CODEX_REVIEW_BOT -->\n\n## Codex Review\n\nNo significant changes to review.")
+                  with open("review_openai.md", "w") as f:
+                      f.write("<!-- CODEX_REVIEW_OPENAI -->\n\n## OpenAI Review\n\nNo significant changes to review.")
                   return
 
               client = OpenAI(api_key=api_key)
               chunks = chunk_diff(diff)
-
-              # Cap at 10 chunks to control cost
               if len(chunks) > 10:
                   chunks = chunks[:10]
 
@@ -115,37 +112,30 @@ jobs:
                   if result:
                       reviews.append(result)
 
-              if not reviews:
-                  merged = "No issues found."
-              elif len(reviews) == 1:
-                  merged = reviews[0]
-              else:
-                  merged = "\n\n---\n\n".join(reviews)
-
+              merged = "\n\n---\n\n".join(reviews) if len(reviews) > 1 else (reviews[0] if reviews else "No issues found.")
               chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
               markdown = (
-                  f"<!-- CODEX_REVIEW_BOT -->\n\n"
-                  f"## Codex Review\n\n"
+                  f"<!-- CODEX_REVIEW_OPENAI -->\n\n"
+                  f"## OpenAI Review\n\n"
                   f"{merged}\n\n"
                   f"---\n"
                   f"*Model: `{model}`{chunk_note}*\n"
               )
-              with open("review.md", "w") as f:
+              with open("review_openai.md", "w") as f:
                   f.write(markdown)
-
 
           if __name__ == "__main__":
               main()
           PYEOF
 
-      - name: Run review
+      - name: Run OpenAI review
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
           DIFF: ${{ github.event.inputs.diff }}
         run: python codex_review.py
 
-      - name: Post or update PR comment
+      - name: Post or update OpenAI comment
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ github.event.inputs.pr_number }}
@@ -154,12 +144,11 @@ jobs:
           github-token: ${{ secrets.PAT_JSK_PRINTING }}
           script: |
             const fs = require('fs');
-            const review = fs.readFileSync('review.md', 'utf8');
+            const review = fs.readFileSync('review_openai.md', 'utf8');
             const [owner, repo] = process.env.REPO.split('/');
             const prNumber = parseInt(process.env.PR_NUMBER, 10);
-            const marker = '<!-- CODEX_REVIEW_BOT -->';
+            const marker = '<!-- CODEX_REVIEW_OPENAI -->';
 
-            // Find existing bot comment
             const { data: comments } = await github.rest.issues.listComments({
               owner, repo, issue_number: prNumber
             });
@@ -169,10 +158,155 @@ jobs:
               await github.rest.issues.updateComment({
                 owner, repo, comment_id: existing.id, body: review
               });
-              console.log(`Updated existing comment #${existing.id}`);
+              console.log(`Updated OpenAI comment #${existing.id}`);
             } else {
               await github.rest.issues.createComment({
                 owner, repo, issue_number: prNumber, body: review
               });
-              console.log('Created new review comment');
+              console.log('Created OpenAI review comment');
+            }
+
+  gemini-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install google-genai
+
+      - name: Create Gemini review script
+        run: |
+          cat > gemini_review.py << 'PYEOF'
+          import os
+          from google import genai
+
+          MAX_CHUNK = 3000
+
+          SYSTEM_PROMPT = (
+              "You are a senior software engineer reviewing a pull request.\n"
+              "Review the code diff for:\n"
+              "1. Bugs and correctness issues\n"
+              "2. Security vulnerabilities\n"
+              "3. Performance problems\n"
+              "4. Missing tests\n"
+              "5. Architecture and readability improvements\n\n"
+              "Return output in EXACTLY this markdown format (omit sections with no issues):\n\n"
+              "## Bugs\n- item\n\n"
+              "## Security Issues\n- item\n\n"
+              "## Performance Concerns\n- item\n\n"
+              "## Missing Tests\n- item\n\n"
+              "## Suggestions\n- item\n\n"
+              "Be concise (max 300 words). If everything looks good, write only:\n"
+              "## Suggestions\n"
+              "- Code looks good. [one small improvement]"
+          )
+
+
+          def chunk_diff(diff: str) -> list:
+              if len(diff) <= MAX_CHUNK:
+                  return [diff]
+              chunks = []
+              while diff:
+                  if len(diff) <= MAX_CHUNK:
+                      chunks.append(diff)
+                      break
+                  cut = diff.rfind("\ndiff --git ", 0, MAX_CHUNK)
+                  if cut <= 0:
+                      cut = diff.rfind("\n", 0, MAX_CHUNK)
+                  if cut <= 0:
+                      cut = MAX_CHUNK
+                  chunks.append(diff[:cut])
+                  diff = diff[cut:]
+              return chunks
+
+
+          def review_chunk(client, model, chunk, idx, total):
+              label = f"(chunk {idx}/{total}) " if total > 1 else ""
+              prompt = f"{SYSTEM_PROMPT}\n\nReview this code diff {label}:\n\n```diff\n{chunk}\n```"
+              try:
+                  resp = client.models.generate_content(
+                      model=model,
+                      contents=prompt,
+                  )
+                  return (resp.text or "").strip()
+              except Exception as e:
+                  return f"Review failed for chunk {idx}: {e}"
+
+
+          def main():
+              api_key = os.environ["GEMINI_API_KEY"]
+              diff = os.environ.get("DIFF", "").strip()
+              model = os.environ.get("GEMINI_MODEL") or "gemini-2.0-flash"
+
+              if not diff:
+                  with open("review_gemini.md", "w") as f:
+                      f.write("<!-- CODEX_REVIEW_GEMINI -->\n\n## Gemini Review\n\nNo significant changes to review.")
+                  return
+
+              client = genai.Client(api_key=api_key)
+              chunks = chunk_diff(diff)
+              if len(chunks) > 10:
+                  chunks = chunks[:10]
+
+              reviews = []
+              for i, chunk in enumerate(chunks, 1):
+                  result = review_chunk(client, model, chunk, i, len(chunks))
+                  if result:
+                      reviews.append(result)
+
+              merged = "\n\n---\n\n".join(reviews) if len(reviews) > 1 else (reviews[0] if reviews else "No issues found.")
+              chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
+              markdown = (
+                  f"<!-- CODEX_REVIEW_GEMINI -->\n\n"
+                  f"## Gemini Review\n\n"
+                  f"{merged}\n\n"
+                  f"---\n"
+                  f"*Model: `{model}`{chunk_note}*\n"
+              )
+              with open("review_gemini.md", "w") as f:
+                  f.write(markdown)
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      - name: Run Gemini review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          DIFF: ${{ github.event.inputs.diff }}
+        run: python gemini_review.py
+
+      - name: Post or update Gemini comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          REPO: ${{ github.event.inputs.repo }}
+        with:
+          github-token: ${{ secrets.PAT_JSK_PRINTING }}
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('review_gemini.md', 'utf8');
+            const [owner, repo] = process.env.REPO.split('/');
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const marker = '<!-- CODEX_REVIEW_GEMINI -->';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number: prNumber
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: review
+              });
+              console.log(`Updated Gemini comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber, body: review
+              });
+              console.log('Created Gemini review comment');
             }
