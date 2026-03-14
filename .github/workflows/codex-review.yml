@@ -151,7 +151,7 @@ jobs:
           PR_NUMBER: ${{ github.event.inputs.pr_number }}
           REPO: ${{ github.event.inputs.repo }}
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN_JSK }}
+          github-token: ${{ secrets.PAT_JSK_PRINTING }}
           script: |
             const fs = require('fs');
             const review = fs.readFileSync('review.md', 'utf8');
