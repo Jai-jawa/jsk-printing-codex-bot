@@ -94,7 +94,7 @@ jobs:
           def main():
               api_key = os.environ["OPENAI_API_KEY"]
               diff = os.environ.get("DIFF", "").strip()
-              model = os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+              model = os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
 
               if not diff:
                   with open("review_openai.md", "w") as f:
